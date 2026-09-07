@@ -14,4 +14,7 @@ interface IInfinityRouter is ICLRouterBase, IBinRouterBase {
     error TooLittleReceived(uint256 minAmountOutReceived, uint256 amountReceived);
     /// @notice Emitted when an exactOutput is asked for more than its maxAmountIn
     error TooMuchRequested(uint256 maxAmountInRequested, uint256 amountRequested);
+    /// @notice Emitted when an exactOutput swap (or hop) delivers less than the requested amount, e.g. a
+    ///         pool runs out of liquidity before the price limit. Exact output is all-or-nothing.
+    error ExactOutputUnfilled(uint256 amountOutRequested, uint256 amountOutReceived);
 }

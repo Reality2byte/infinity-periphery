@@ -29,10 +29,10 @@ abstract contract CLRouterBase is ICLRouterBase, DeltaResolver {
             amountIn =
                 _getFullCredit(params.zeroForOne ? params.poolKey.currency0 : params.poolKey.currency1).toUint128();
         }
-        uint128 amountOut = _swapExactPrivate(
-                params.poolKey, params.zeroForOne, -int256(uint256(amountIn)), params.hookData
-            )
-            .toUint128();
+        uint128 amountOut = _swapOutput(
+            _swapExactPrivate(params.poolKey, params.zeroForOne, -int256(uint256(amountIn)), params.hookData),
+            params.zeroForOne
+        );
         if (amountOut < params.amountOutMinimum) {
             revert IInfinityRouter.TooLittleReceived(params.amountOutMinimum, amountOut);
         }
@@ -52,8 +52,9 @@ abstract contract CLRouterBase is ICLRouterBase, DeltaResolver {
                 pathKey = params.path[i];
                 (PoolKey memory poolKey, bool zeroForOne) = pathKey.getPoolAndSwapDirection(currencyIn);
                 // The output delta will always be positive, except for when interacting with certain hook pools
-                amountOut =
-                    _swapExactPrivate(poolKey, zeroForOne, -int256(uint256(amountIn)), pathKey.hookData).toUint128();
+                amountOut = _swapOutput(
+                    _swapExactPrivate(poolKey, zeroForOne, -int256(uint256(amountIn)), pathKey.hookData), zeroForOne
+                );
 
                 amountIn = amountOut;
                 currencyIn = pathKey.intermediateCurrency;
@@ -71,10 +72,16 @@ abstract contract CLRouterBase is ICLRouterBase, DeltaResolver {
             amountOut =
                 _getFullDebt(params.zeroForOne ? params.poolKey.currency1 : params.poolKey.currency0).toUint128();
         }
-        uint128 amountIn = (-_swapExactPrivate(
-                params.poolKey, params.zeroForOne, int256(uint256(amountOut)), params.hookData
-            ))
-        .toUint128();
+        BalanceDelta delta =
+            _swapExactPrivate(params.poolKey, params.zeroForOne, int256(uint256(amountOut)), params.hookData);
+        // exact output is all-or-nothing: a pool can deliver less than requested if it runs out of
+        // liquidity before the price limit. Reverting on a shortfall keeps "exact output" exact;
+        // over-delivery (possible only via hook pools) is allowed.
+        uint128 amountOutActual = _swapOutput(delta, params.zeroForOne);
+        if (amountOutActual < amountOut) {
+            revert IInfinityRouter.ExactOutputUnfilled(amountOut, amountOutActual);
+        }
+        uint128 amountIn = _swapInput(delta, params.zeroForOne);
         if (amountIn > params.amountInMaximum) {
             revert IInfinityRouter.TooMuchRequested(params.amountInMaximum, amountIn);
         }
@@ -96,13 +103,17 @@ abstract contract CLRouterBase is ICLRouterBase, DeltaResolver {
             for (uint256 i = pathLength; i > 0; i--) {
                 pathKey = params.path[i - 1];
                 (PoolKey memory poolKey, bool oneForZero) = pathKey.getPoolAndSwapDirection(currencyOut);
-                // The output delta will always be negative, except for when interacting with certain hook pools
-                amountIn = (uint256(
-                            -int256(
-                                _swapExactPrivate(poolKey, !oneForZero, int256(uint256(amountOut)), pathKey.hookData)
-                            )
-                        ))
-                    .toUint128();
+                // The output delta will always be positive, except for when interacting with certain hook pools
+                BalanceDelta delta =
+                    _swapExactPrivate(poolKey, !oneForZero, int256(uint256(amountOut)), pathKey.hookData);
+                uint128 amountOutActual = _swapOutput(delta, !oneForZero);
+                // Every hop must fill. The vault nets one delta per currency across the whole unlock, so an
+                // intermediate shortfall can be absorbed by same-currency credit and settle silently rather
+                // than reverting -- and the amountInMaximum check below only ever sees the last hop's input.
+                if (amountOutActual < amountOut) {
+                    revert IInfinityRouter.ExactOutputUnfilled(amountOut, amountOutActual);
+                }
+                amountIn = _swapInput(delta, !oneForZero);
 
                 amountOut = amountIn;
                 currencyOut = pathKey.intermediateCurrency;
@@ -113,21 +124,30 @@ abstract contract CLRouterBase is ICLRouterBase, DeltaResolver {
         }
     }
 
-    /// @return reciprocalAmount The amount of the reciprocal token
-    //      If exactInput token0 for token1, the reciprocalAmount is the amount of token1.
-    //      If exactOutput token0 for token1, the reciprocalAmount is the amount of token0.
+    /// @return delta The balance delta of the swap, from the swapper's perspective
     function _swapExactPrivate(PoolKey memory poolKey, bool zeroForOne, int256 amountSpecified, bytes calldata hookData)
         private
-        returns (int128 reciprocalAmount)
+        returns (BalanceDelta delta)
     {
-        BalanceDelta delta = clPoolManager.swap(
+        delta = clPoolManager.swap(
             poolKey,
             ICLPoolManager.SwapParams(
                 zeroForOne, amountSpecified, zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1
             ),
             hookData
         );
+    }
 
-        reciprocalAmount = (zeroForOne == amountSpecified < 0) ? delta.amount1() : delta.amount0();
+    /// @notice The positive input amount a swap consumed, derived from its balance delta.
+    /// @dev The spent currency's delta is negative (owed to the pool), so negate it to a positive amount.
+    function _swapInput(BalanceDelta delta, bool zeroForOne) private pure returns (uint128) {
+        return (uint256(-int256(zeroForOne ? delta.amount0() : delta.amount1()))).toUint128();
+    }
+
+    /// @notice The positive output amount a swap produced, derived from its balance delta. For an
+    ///         exactOutput swap this is the REALIZED output, which can be less than the requested
+    ///         amount when the pool lacks the liquidity to fill it before the price limit.
+    function _swapOutput(BalanceDelta delta, bool zeroForOne) private pure returns (uint128) {
+        return (zeroForOne ? delta.amount1() : delta.amount0()).toUint128();
     }
 }
